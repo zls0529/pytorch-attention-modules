@@ -19,6 +19,7 @@ class SELayer(nn.Module):
         # Fully connected bottleneck used to learn channel-wise attention weights.
         self.fc = nn.Sequential(
             # Reduce channel dimensionality: C → C // reduction
+            # nn.Linear(in_features, out_features) # batch 维度始终保留，用于并行计算
             nn.Linear(channel, channel // reduction, bias=False),
             # Non-linear activation to model complex channel dependencies
             nn.ReLU(inplace=True),
@@ -59,6 +60,7 @@ if __name__ == "__main__":
     # Instantiate the SE layer with 64 input channels
     se_layer = SELayer(channel=64)
     # Apply channel attention to the input tensor
+    # y is the attetion we learn here
     y = se_layer(x)
     # Print output shape (should match input shape)
     print(y.shape)  # Expected: torch.Size([4, 64, 32, 32])
