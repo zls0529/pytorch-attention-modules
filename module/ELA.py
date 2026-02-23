@@ -1,58 +1,94 @@
 import torch
 import torch.nn as nn
- 
+
 class ELA(nn.Module):
     def __init__(self, in_channels, phi):
+        """
+        ELA (Efficient/Edge-aware Lightweight Attention) module.
+
+        Notes (as provided in your comments):
+        - ELA-T and ELA-B are lightweight variants, suitable for shallow or lightweight CNNs.
+        - ELA-B and ELA-S tend to work better in deeper networks.
+        - ELA-L is designed for large networks.
+
+        Args:
+            in_channels (int): Number of input channels C.
+            phi (str): Variant selector in {'T', 'B', 'S', 'L'} controlling kernel size / groups / GN groups.
+        """
         super(ELA, self).__init__()
-        """
-        ELA-T 和 ELA-B 设计为轻量级，非常适合网络层数较少或轻量级网络的 CNN 架构
-        ELA-B 和 ELA-S 在具有更深结构的网络上表现最佳
-        ELA-L 特别适合大型网络。
-        
-        参数:
-        - in_channels (int): 输入特征图的通道数
-        - phi (str): 表示卷积核大小和组数的选择，'T', 'B', 'S', 'L'中的一个
-        """
-        # 根据 phi 参数选择不同的卷积核大小
-        Kernel_size = {'T': 5, 'B': 7, 'S': 5, 'L': 7}[phi]
-        # 根据 phi 参数选择不同的卷积组数
+
+        # Kernel size for 1D convolution (controls receptive field along H or W)
+        kernel_size = {'T': 5, 'B': 7, 'S': 5, 'L': 7}[phi]
+
+        # Group count for grouped Conv1d
+        # - 'T'/'B': depthwise-like (groups=C) -> very lightweight
+        # - 'S'/'L': groups=C/8 -> less grouped, more cross-channel mixing
         groups = {'T': in_channels, 'B': in_channels, 'S': in_channels // 8, 'L': in_channels // 8}[phi]
-        # 根据 phi 参数选择不同的归一化组数
-        num_groups = {'T': 32, 'B': 16, 'S': 16, 'L': 16}[phi] 
-        # 计算填充大小以保持卷积后尺寸不变
-        pad = Kernel_size // 2
-        # 1D 卷积层，使用分组卷积，卷积核大小为 Kernel_size
-        self.con1 = nn.Conv1d(in_channels, in_channels, kernel_size=Kernel_size, padding=pad, groups=groups, bias=False)
-        # 组归一化层
-        self.GN = nn.GroupNorm(num_groups, in_channels)
-        # Sigmoid 激活函数
+
+        # GroupNorm groups (controls normalization granularity)
+        num_groups = {'T': 32, 'B': 16, 'S': 16, 'L': 16}[phi]
+
+        # "Same" padding for Conv1d
+        pad = kernel_size // 2
+
+        # Shared 1D convolution applied on both height-pooled and width-pooled signals
+        # Input/output: (B, C, L) -> (B, C, L)
+        self.conv1 = nn.Conv1d(
+            in_channels=in_channels,
+            out_channels=in_channels,
+            kernel_size=kernel_size,
+            padding=pad,
+            groups=groups,
+            bias=False
+        )
+
+        # GroupNorm normalizes over channels for each sample: works well for small batch sizes
+        self.gn = nn.GroupNorm(num_groups, in_channels)
+
+        # Sigmoid produces attention weights in (0, 1)
         self.sigmoid = nn.Sigmoid()
- 
-    def forward(self, input):
+
+    def forward(self, x):
         """
-        前向传播函数。
-        参数:
-        - input (torch.Tensor): 输入特征图，形状为 (batch_size, channels, height, width)
-        返回:
-        - torch.Tensor: 应用边缘注意力后的特征图
+        Forward pass.
+
+        Args:
+            x (Tensor): Input feature map of shape (B, C, H, W).
+
+        Returns:
+            Tensor: Output feature map of shape (B, C, H, W) with ELA applied.
         """
-        b, c, h, w = input.size()  # 获取输入特征图的形状
-        # 在宽度方向上进行平均池化
-        x_h = torch.mean(input, dim=3, keepdim=True).view(b, c, h)
-        # 在高度方向上进行平均池化
-        x_w = torch.mean(input, dim=2, keepdim=True).view(b, c, w)
-        # 对池化后的特征图应用 1D 卷积
-        x_h = self.con1(x_h)  # [b, c, h]
-        x_w = self.con1(x_w)  # [b, c, w]
-        # 对卷积后的特征图进行归一化和激活，并 reshape 回来
-        x_h = self.sigmoid(self.GN(x_h)).view(b, c, h, 1)  # [b, c, h, 1]
-        x_w = self.sigmoid(self.GN(x_w)).view(b, c, 1, w)  # [b, c, 1, w]
-        # 将输入特征图、x_h 和 x_w 按元素相乘，得到最终的输出特征图
-        return x_h * x_w * input
- 
+        b, c, h, w = x.size()
+
+        # 1) Pool along width to get a height-wise descriptor
+        # mean over W: (B, C, H, W) -> (B, C, H, 1) -> reshape -> (B, C, H)
+        x_h = torch.mean(x, dim=3, keepdim=True).view(b, c, h)
+
+        # 2) Pool along height to get a width-wise descriptor
+        # mean over H: (B, C, H, W) -> (B, C, 1, W) -> reshape -> (B, C, W)
+        x_w = torch.mean(x, dim=2, keepdim=True).view(b, c, w)
+
+        # 3) Apply the shared Conv1d to model local dependencies along H and W
+        # (B, C, H) -> (B, C, H), (B, C, W) -> (B, C, W)
+        x_h = self.conv1(x_h)
+        x_w = self.conv1(x_w)
+
+        # 4) Normalize + sigmoid to produce two 1D attention maps
+        # Note: GroupNorm can accept (N, C, L) and normalizes across C dimension.
+        # x_h: (B, C, H) -> GN+sigmoid -> (B, C, H) -> reshape -> (B, C, H, 1)
+        x_h = self.sigmoid(self.gn(x_h)).view(b, c, h, 1)
+
+        # x_w: (B, C, W) -> GN+sigmoid -> (B, C, W) -> reshape -> (B, C, 1, W)
+        x_w = self.sigmoid(self.gn(x_w)).view(b, c, 1, w)
+
+        # 5) Apply attention (broadcast multiply)
+        # x_h broadcasts across W; x_w broadcasts across H
+        return x_h * x_w * x
+
+
 if __name__ == "__main__":
-    # 创建一个形状为 [batch_size, channels, height, width] 的虚拟输入张量
-    input = torch.randn(1, 32, 256, 256)
+    # Sanity check
+    x = torch.randn(1, 32, 256, 256)
     ela = ELA(in_channels=32, phi='T')
-    output = ela(input)
-    print(output.size())
+    y = ela(x)
+    print(y.size())  # Expected: torch.Size([1, 32, 256, 256])
